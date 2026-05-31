@@ -1,0 +1,40 @@
+[build-system]
+requires = ["meson-python>=0.15.0", "numpy>=1.22", "ninja"]
+build-backend = "mesonpy"
+
+[project]
+name = "optop"
+version = "1.0.0"
+description = "Order-parameter computation (Fortran/MPI) and XGBoost phase classification for molecular trajectories"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+authors = [{ name = "Diksha Kadre", email = "dikshakadre@iisc.ac.in" }]
+keywords = ["order-parameters", "steinhardt", "molecular-dynamics", "machine-learning", "phase-classification", "gas-hydrates"]
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Fortran",
+  "License :: OSI Approved :: MIT License",
+  "Operating System :: POSIX :: Linux",
+  "Topic :: Scientific/Engineering :: Chemistry",
+  "Topic :: Scientific/Engineering :: Physics",
+]
+dependencies = [
+  "numpy>=1.22",
+  "pandas",
+  "scikit-learn",
+  "xgboost",
+  "mlxtend",
+  "matplotlib",
+]
+
+[project.optional-dependencies]
+mpi = ["mpi4py"]
+
+[project.scripts]
+OptOP = "optop.cli:main"
+optop = "optop.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/dikshaiisc/OptOP"
+Repository = "https://github.com/dikshaiisc/OptOP"
