@@ -26,7 +26,8 @@ order‑parameter families, and the ML hyper‑parameters.
     explicitly or auto‑detected from element symbols)
 - **Triclinic boxes** handled exactly (tilt factors `xy/xz/yz`)
 - **Heterogeneous molecules** (different atom counts per molecule, e.g. water + methane)
-- **MPI parallel** over trajectory frames (`mpiexec -n N`)
+- **MPI parallel** — over trajectory frames, or **2D frame × atom** decomposition
+  via `--atom-ranks` (sub-communicators); both are bit-identical to serial
 - **ML classifier**: XGBoost + feature‑importance ranking + RandomizedSearchCV
   tuning + Sequential Forward Selection, with confusion matrices, accuracy
   curves and per‑class reports for every model.
@@ -95,7 +96,34 @@ Key `compute` options:
 | `--op-categories` | `B,D,F,I,Q,W,LQ,LW` or `all` (default: all) |
 | `--op-type` | `avg` / `local` / `both` |
 | `--last-frames` | use only the last N frames per trajectory |
+| `--structure` | box/PBC treatment: `auto` (default; tilt-aware iff the dump declares tilt), `orthorhombic` (ignore tilt, use raw lo/hi bounds), `triclinic` (exact tilt-aware minimum image) |
+| `--atom-ranks` | MPI ranks per frame-group for **2D (frame × atom) decomposition** (default `1` = frame-only); total ranks must be a multiple of this |
 | `--outdir` | output directory |
+
+#### Periodic boundaries (orthorhombic vs triclinic)
+
+Orthogonal cells (`pp pp pp`) are handled identically by all three modes. For a
+triclinic dump (`ITEM: BOX BOUNDS xy xz yz ...`, e.g. structure **sH**), `auto`
+and `triclinic` convert the LAMMPS bounding box back to the true cell edges and
+apply the exact tilt-aware minimum image, while `orthorhombic` ignores the tilt
+and uses the raw `(lo, hi)` extents. The default `auto` is what reproduces the
+reference order parameters for every phase, including the triclinic sH cell.
+
+#### Two-dimensional MPI decomposition (frames × atoms)
+
+By default MPI parallelises over **frames** (round-robin). With `--atom-ranks P`
+the `N` ranks are split into `G = N/P` frame-groups of `P` ranks each: frames are
+distributed round-robin across the `G` groups, and within a group the `P` ranks
+split the central molecules of each frame, cooperating through two MPI
+all-reduces per frame. This adds a second parallel axis for very large single
+frames. The result is **bit-identical** to the frame-only (`--atom-ranks 1`) and
+serial runs, because every molecule is computed independently.
+
+```bash
+# 48 ranks = 12 frame-groups x 4 atom-ranks
+mpiexec -n 48 OptOP compute --traj phases/ --central-type 1 \
+      --neighbor-types 1,2,3 --rcut 4.5 --atom-ranks 4 --outdir out/
+```
 
 ### Train a classifier
 

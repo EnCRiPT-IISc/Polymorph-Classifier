@@ -121,11 +121,27 @@ def count_frames(path: str, meta: FrameMeta) -> int:
     return total_lines // meta.lines_per_frame
 
 
-def read_frame(fh, meta: FrameMeta):
+def read_frame(fh, meta: FrameMeta, structure: str = "auto"):
     """Read one frame. Returns (timestep, box, mol_ids, atom_types, coords) or None.
 
-    For triclinic boxes, box is still (lx, ly, lz) — the orthogonal extents.
-    Tilt factors are ignored for the neighbor cutoff (approximation).
+    ``structure`` selects how the periodic box / PBC are built:
+      - "auto"         : triclinic tilt is applied iff the dump header carries
+                         tilt factors (``ITEM: BOX BOUNDS xy xz yz ...``);
+                         otherwise the box is treated as orthogonal.
+      - "orthorhombic" : tilt factors are IGNORED — the raw (lo, hi) bounds of
+                         each box line are used as the orthogonal edge lengths
+                         (lx = xhi - xlo, ...).  This reproduces the original
+                         reference code/hydrate_*.f90, which read only the two
+                         lo/hi numbers and used a diagonal lattice even for the
+                         triclinic sH structure.  Use this to match features_SC.
+      - "triclinic"    : the LAMMPS bounding box is converted back to the true
+                         cell edges and the tilt factors (xy, xz, yz) are kept,
+                         giving the physically-exact minimum image for sloped
+                         cells.  (For an orthogonal dump this is identical to
+                         "orthorhombic".)
+
+    box is returned as (lx, ly, lz, xy, xz, yz); tilt factors are zero unless a
+    triclinic treatment is in effect.
     """
     line = fh.readline()
     if not line:
@@ -145,18 +161,31 @@ def read_frame(fh, meta: FrameMeta):
     y_lo, y_hi = float(by[0]), float(by[1])
     z_lo, z_hi = float(bz[0]), float(bz[1])
 
-    # Tilt factors for triclinic cells. For triclinic boxes LAMMPS dumps the
-    # *bounding* box: each line is (lo_bound, hi_bound, tilt). Convert the
-    # bounding box back to the true box edges so the lattice vectors are exact.
+    # Decide whether to apply a triclinic treatment for THIS frame.
+    #   "triclinic"    -> always (when tilt columns are present)
+    #   "auto"         -> only if the header advertised tilt (meta.triclinic)
+    #   "orthorhombic" -> never (ignore tilt; use raw lo/hi bounds)
+    has_tilt_cols = len(bx) >= 3 and len(by) >= 3 and len(bz) >= 3
+    if structure == "triclinic":
+        use_triclinic = has_tilt_cols
+    elif structure == "orthorhombic":
+        use_triclinic = False
+    else:  # "auto"
+        use_triclinic = meta.triclinic and has_tilt_cols
+
+    # For a true triclinic cell LAMMPS dumps the *bounding* box: each line is
+    # (lo_bound, hi_bound, tilt). Convert the bounding box back to the real box
+    # edges so the lattice vectors are exact.
     #   xlo = xlo_bound - MIN(0, xy, xz, xy+xz);  xhi = xhi_bound - MAX(...)
     #   ylo = ylo_bound - MIN(0, yz);             yhi = yhi_bound - MAX(0, yz)
-    if meta.triclinic and len(bx) >= 3 and len(by) >= 3 and len(bz) >= 3:
+    if use_triclinic:
         xy, xz, yz = float(bx[2]), float(by[2]), float(bz[2])
         x_lo -= min(0.0, xy, xz, xy + xz)
         x_hi -= max(0.0, xy, xz, xy + xz)
         y_lo -= min(0.0, yz)
         y_hi -= max(0.0, yz)
     else:
+        # orthogonal treatment: raw lo/hi bounds, zero tilt (legacy behaviour)
         xy = xz = yz = 0.0
 
     # box = (lx, ly, lz, xy, xz, yz); tilt factors are zero for orthogonal cells.

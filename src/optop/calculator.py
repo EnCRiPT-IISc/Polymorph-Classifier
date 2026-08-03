@@ -16,6 +16,8 @@ from ._trajectory import scan_first_frame, count_frames, read_frame, \
                           build_masses_by_type
 from ._fortran_ext import init, compute_frame as _fortran_compute, \
                           compute_frame_partial as _fortran_compute_partial, \
+                          compute_local_range as _fortran_local_range, \
+                          compute_avg_range as _fortran_avg_range, \
                           build_lat_vecs
 from ._constants import OP_COLUMNS, OP_COLUMNS_AVG
 
@@ -74,7 +76,8 @@ class MPIOPCalculator:
     """
 
     def __init__(self, rcut=4.5, central_type=1, neighbor_types=None,
-                 op_categories=None, last_frames=None, com=False, masses_map=None):
+                 op_categories=None, last_frames=None, com=False, masses_map=None,
+                 structure="auto", atom_ranks=1):
         self.rcut = rcut
         self.rcutsq = rcut * rcut
         self.central_type = central_type
@@ -83,6 +86,10 @@ class MPIOPCalculator:
         self.last_frames = last_frames   # None = all frames
         self.com = com                   # COM-COM mode (one COM per molecule)
         self.masses_map = masses_map     # {atom_type: mass} overrides for COM
+        if structure not in ("auto", "orthorhombic", "triclinic"):
+            raise ValueError(f"structure must be auto/orthorhombic/triclinic, got {structure!r}")
+        self.structure = structure       # PBC treatment (see _trajectory.read_frame)
+        self.atom_ranks = max(1, int(atom_ranks))  # MPI ranks per frame-group (2D decomp)
 
     def compute_all(self, traj_path, out_prefix="OP", out_dir=".",
                     verbose=True, write_csv=True):
@@ -93,6 +100,12 @@ class MPIOPCalculator:
             size = comm.Get_size()
         except ImportError:
             comm, rank, size = None, 0, 1
+
+        # 2D (frame x atom/molecule) decomposition is only meaningful with >1
+        # rank; otherwise fall through to the (frame-only) path below.
+        if self.atom_ranks > 1 and comm is not None and size > 1:
+            return self._compute_all_2d(comm, rank, size, traj_path,
+                                        out_prefix, out_dir, verbose, write_csv)
 
         meta = scan_first_frame(traj_path)
         n_frames = count_frames(traj_path, meta)
@@ -160,7 +173,7 @@ class MPIOPCalculator:
                     skip_frames(fh, target - cur_frame, meta)
                     cur_frame = target
 
-                result = read_frame(fh, meta)
+                result = read_frame(fh, meta, structure=self.structure)
                 cur_frame += 1
                 if result is None:
                     break
@@ -233,6 +246,164 @@ class MPIOPCalculator:
                 df_avg.to_csv(os.path.join(out_dir, f"{out_prefix}_avg.csv"), index=False)
             if verbose:
                 print(f"[OP_ML] Done in {time.time()-t0:.1f}s", flush=True)
+            return df_local, df_avg
+        return None, None
+
+    # ── 2D (frame x atom/molecule) MPI decomposition ────────────────────────
+    @staticmethod
+    def _unpack_org(org):
+        """Map organise_coords output to a uniform 5-tuple for the 2D kernels.
+        OO/COM-COM (3-tuple) -> r_mol == r_central, n_mol == n_cen."""
+        if len(org) == 5:
+            r_central, r_mol, r_list, mol_list, n_cen = org
+        else:
+            r_central, r_list, mol_list = org
+            r_mol = r_central
+            n_cen = r_central.shape[0]
+        return r_central, r_mol, r_list, mol_list, n_cen
+
+    def _compute_all_2d(self, comm, rank, size, traj_path,
+                        out_prefix, out_dir, verbose, write_csv):
+        """2D decomposition: COMM_WORLD is split into G frame-groups, each of P
+        = ``self.atom_ranks`` ranks (so size = G*P, P must divide size).  Frames
+        are distributed round-robin across the G groups; within a group the P
+        ranks split the central molecules and cooperatively compute each frame
+        via compute_local_range -> Allreduce -> compute_avg_range -> Allreduce.
+        The per-molecule result is bit-identical to the serial computation."""
+        from mpi4py import MPI
+
+        P = self.atom_ranks
+        if size % P != 0:
+            # Collective misconfiguration — every rank sees it, so every rank
+            # raises (raising on rank 0 alone would deadlock the others).
+            raise ValueError(f"--atom-ranks ({P}) must divide the total number "
+                             f"of MPI ranks ({size}).")
+        G = size // P
+        group_id   = rank // P          # which frame-group (0..G-1)
+        group_rank = rank % P           # position within the group (0..P-1)
+        group_comm = comm.Split(color=group_id, key=group_rank)
+
+        # ---- metadata (rank 0 counts frames, broadcasts) ----
+        meta = scan_first_frame(traj_path)
+        n_frames = count_frames(traj_path, meta) if rank == 0 else None
+        n_frames = comm.bcast(n_frames, root=0)
+
+        nt_set = set(self.neighbor_types or [self.central_type])
+        mixed_atomic = (nt_set != {self.central_type})
+
+        with open(traj_path, "r") as fh:
+            _, _, mol_ids_0, atm_types_0, _ = read_frame(fh, meta, structure=self.structure)
+        masses_by_type = None
+        if self.com:
+            masses_by_type = build_masses_by_type(meta, self.masses_map)
+            cen_mask = np.isin(mol_ids_0, mol_ids_0[atm_types_0 == self.central_type])
+            n_cen = int(np.unique(mol_ids_0[cen_mask]).shape[0])
+        else:
+            n_cen = int(np.sum(atm_types_0 == self.central_type))
+
+        if self.last_frames is not None and self.last_frames < n_frames:
+            start_frame, use_n_frames = n_frames - self.last_frames, self.last_frames
+        else:
+            start_frame, use_n_frames = 0, n_frames
+
+        if rank == 0 and verbose:
+            print(f"[OP_ML] 2D decomposition: {size} ranks = {G} frame-group(s) x {P} "
+                  f"atom-rank(s); {use_n_frames} frames, {n_cen} central molecules, "
+                  f"rcut={self.rcut} A, structure={self.structure}", flush=True)
+
+        init(n_cen)
+
+        # molecule slice owned by this rank within its group (1-based, inclusive)
+        bounds = np.linspace(0, n_cen, P + 1).astype(int)
+        mol_lo, mol_hi = int(bounds[group_rank]) + 1, int(bounds[group_rank + 1])
+
+        # frames handled by THIS group (round-robin over G groups)
+        my_frames = list(range(start_frame + group_id, start_frame + use_n_frames, G))
+
+        local_rows, avg_rows = [], []
+        t0 = time.time()
+        fh = open(traj_path, "r") if group_rank == 0 else None
+        cur_frame = 0
+        if fh is not None and my_frames:
+            skip_frames(fh, my_frames[0], meta)
+            cur_frame = my_frames[0]
+
+        for target in my_frames:
+            # group-root reads + organises the frame, broadcasts to the group
+            if group_rank == 0:
+                if cur_frame < target:
+                    skip_frames(fh, target - cur_frame, meta)
+                    cur_frame = target
+                result = read_frame(fh, meta, structure=self.structure)
+                cur_frame += 1
+                ts, box, mol_ids, atm_types, coords = result
+                if self.com:
+                    lat_vecs, rlat_vecs = build_lat_vecs(box)
+                    org = organise_coords_com(coords, mol_ids, atm_types,
+                                              self.central_type, self.neighbor_types,
+                                              masses_by_type, lat_vecs, rlat_vecs)
+                else:
+                    org = organise_coords(coords, mol_ids, atm_types, meta,
+                                          self.central_type, self.neighbor_types)
+                payload = (box, self._unpack_org(org), ts)
+            else:
+                payload = None
+            box, org5, ts = group_comm.bcast(payload, root=0)
+            r_central, r_mol, r_list, mol_list, n_cen_f = org5
+
+            lat_vecs, rlat_vecs = build_lat_vecs(box)
+
+            # Stage 1: local OPs + q_lm for this rank's molecule slice
+            local, qlm, qnorm = _fortran_local_range(
+                mol_lo, mol_hi, r_central, r_mol, r_list, mol_list,
+                lat_vecs, rlat_vecs, self.rcutsq)
+            group_comm.Allreduce(MPI.IN_PLACE, local, op=MPI.SUM)
+            group_comm.Allreduce(MPI.IN_PLACE, qlm,   op=MPI.SUM)
+            group_comm.Allreduce(MPI.IN_PLACE, qnorm, op=MPI.SUM)
+
+            # Stage 2: averaged OPs for this rank's slice, given full state
+            _, avg = _fortran_avg_range(
+                mol_lo, mol_hi, r_mol, lat_vecs, rlat_vecs, self.rcutsq,
+                local, qlm, qnorm)
+            group_comm.Allreduce(MPI.IN_PLACE, avg, op=MPI.SUM)
+
+            if group_rank == 0:
+                local_op, avg_op = local.T, avg.T          # (n_cen, 383)
+                mol_id_col = np.arange(1, local_op.shape[0] + 1, dtype=np.int32)
+                local_rows.append(pd.DataFrame(
+                    np.column_stack([mol_id_col, local_op]),
+                    columns=["mol_id"] + OP_COLUMNS))
+                avg_rows.append(pd.DataFrame(
+                    np.column_stack([mol_id_col, avg_op]),
+                    columns=["mol_id"] + OP_COLUMNS_AVG))
+                if verbose:
+                    done = target - start_frame + 1
+                    print(f"  group {group_id}: frame {done}/{use_n_frames} "
+                          f"(ts={ts}) {time.time()-t0:.1f}s", flush=True)
+        if fh is not None:
+            fh.close()
+        group_comm.Free()
+
+        df_local = pd.concat(local_rows, ignore_index=True) if local_rows else \
+                   pd.DataFrame(columns=["mol_id"] + OP_COLUMNS)
+        df_avg = pd.concat(avg_rows, ignore_index=True) if avg_rows else \
+                 pd.DataFrame(columns=["mol_id"] + OP_COLUMNS_AVG)
+        df_local["mol_id"] = df_local["mol_id"].astype(int)
+        df_avg["mol_id"] = df_avg["mol_id"].astype(int)
+
+        all_local = comm.gather(df_local, root=0)
+        all_avg = comm.gather(df_avg, root=0)
+        if rank == 0:
+            df_local = pd.concat(all_local, ignore_index=True)
+            df_avg = pd.concat(all_avg, ignore_index=True)
+            df_local = filter_op_columns(df_local, self.op_categories)
+            df_avg = filter_op_columns(df_avg, self.op_categories)
+            if write_csv:
+                os.makedirs(out_dir, exist_ok=True)
+                df_local.to_csv(os.path.join(out_dir, f"{out_prefix}_unavg.csv"), index=False)
+                df_avg.to_csv(os.path.join(out_dir, f"{out_prefix}_avg.csv"), index=False)
+            if verbose:
+                print(f"[OP_ML] Done (2D) in {time.time()-t0:.1f}s", flush=True)
             return df_local, df_avg
         return None, None
 

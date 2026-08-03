@@ -179,6 +179,58 @@ def compute_frame_partial(
     return local_f.T.copy(), avg_f.T.copy()
 
 
+def compute_local_range(
+    mol_lo: int, mol_hi: int,
+    r_central: np.ndarray,   # (n_cen, 3)
+    r_mol: np.ndarray,       # (n_mol, 3)
+    r_list: np.ndarray,      # (n_list, 3)
+    mol_list: np.ndarray,    # (n_list,)
+    lat_vecs: np.ndarray,
+    rlat_vecs: np.ndarray,
+    rcutsq: float,
+) -> tuple:
+    """Stage 1 of the 2D decomposition: local OPs + normalised q_lm + q-norms
+    for central molecules in the 1-based inclusive range [mol_lo, mol_hi].
+
+    Returns (local, qlm, qnorm) shaped (383, n_cen), (170, n_cen), (10, n_cen)
+    with columns OUTSIDE the range set to exactly zero, so an element-wise
+    MPI_SUM all-reduce across a frame-group rebuilds the full arrays exactly.
+    init(n_cen) must have been called first.
+    """
+    ext = _load()
+    rc_f = np.asfortranarray(r_central.T)
+    rm_f = np.asfortranarray(r_mol.T)
+    rl_f = np.asfortranarray(r_list.T)
+    ml = np.ascontiguousarray(mol_list, dtype=np.int32)
+    local, qlm, qnorm = ext.compute_local_range(
+        mol_lo, mol_hi, rc_f, rm_f, rl_f, ml, lat_vecs, rlat_vecs, rcutsq)
+    return local, qlm, qnorm   # kept in (rows, n_cen) Fortran layout for all-reduce
+
+
+def compute_avg_range(
+    mol_lo: int, mol_hi: int,
+    r_mol: np.ndarray,        # (n_mol, 3)
+    lat_vecs: np.ndarray,
+    rlat_vecs: np.ndarray,
+    rcutsq: float,
+    local_full: np.ndarray,   # (383, n_cen)  — all-reduced stage-1 output
+    qlm_full: np.ndarray,     # (170, n_cen)  — all-reduced stage-1 output
+    qnorm_full: np.ndarray,   # (10, n_cen)   — all-reduced stage-1 output
+) -> tuple:
+    """Stage 2 of the 2D decomposition: averaged (Lechner-Dellago) OPs for
+    central molecules in [mol_lo, mol_hi], given the full all-reduced per-molecule
+    state.  Returns (local, avg) shaped (383, n_cen) with out-of-range columns
+    zero (so an MPI_SUM all-reduce rebuilds the full frame)."""
+    ext = _load()
+    rm_f = np.asfortranarray(r_mol.T)
+    lf = np.asfortranarray(local_full)
+    qf = np.asfortranarray(qlm_full)
+    nf = np.asfortranarray(qnorm_full)
+    local, avg = ext.compute_avg_range(
+        mol_lo, mol_hi, rm_f, lat_vecs, rlat_vecs, rcutsq, lf, qf, nf)
+    return local, avg
+
+
 def build_lat_vecs(box: np.ndarray):
     """Build the lattice matrix (and its inverse) from a box descriptor.
 

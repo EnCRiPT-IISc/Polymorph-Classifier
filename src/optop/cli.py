@@ -54,6 +54,7 @@ def cmd_compute(a):
         neighbor_types=_int_list(a.neighbor_types) if a.neighbor_types else None,
         op_categories=_str_list(a.op_categories) if a.op_categories else None,
         last_frames=a.last_frames, com=a.com, masses_map=_mass_map(a.masses),
+        structure=a.structure, atom_ranks=a.atom_ranks,
     )
     if _rank() == 0:
         os.makedirs(a.outdir, exist_ok=True)
@@ -99,6 +100,13 @@ def _add_compute_args(p):
     p.add_argument("--com", action="store_true", help="COM-COM: reduce each molecule to its center of mass")
     p.add_argument("--masses", default=None, help="COM masses 'type:mass,...' (else auto from element symbols)")
     p.add_argument("--rcut", type=float, default=4.5, help="neighbour cutoff (Angstrom)")
+    p.add_argument("--structure", choices=["auto", "orthorhombic", "triclinic"], default="auto",
+                   help="box/PBC treatment: auto (tilt iff dump has it), orthorhombic "
+                        "(ignore tilt, raw lo/hi bounds — reproduces the reference for sH), "
+                        "triclinic (exact tilt-aware minimum image)")
+    p.add_argument("--atom-ranks", type=int, default=1,
+                   help="MPI ranks per frame-group for 2D (frame x atom) decomposition; "
+                        "1 = frame-only parallelism. Total ranks must be a multiple of this.")
     p.add_argument("--op-categories", default=None, help="OP categories: B,D,F,I,Q,W,LQ,LW or 'all' (default all)")
     p.add_argument("--op-type", choices=["avg", "local", "both"], default="avg", help="output averaged/local/both")
     p.add_argument("--last-frames", type=int, default=None, help="use only the last N frames per trajectory")

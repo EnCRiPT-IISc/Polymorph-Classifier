@@ -111,9 +111,14 @@ subroutine init_op_calc(n_mol_in)
       OrderParameterType(OpNum)%name='B'; OrderParameterType(OpNum)%iarg(1)=n1; OrderParameterType(OpNum)%iarg(2)=n2
       OrderParameterType(OpNum)%arg(1)=PI/2._PR
 
+      ! NOTE: 4th B angle is PI/4 (NOT PI/3) to reproduce the reference
+      ! features_SC / original code/hydrate_*.f90, which define this slot as a
+      ! DUPLICATE PI/4 (the column header is still labelled "1_05" there, an
+      ! upstream mislabel that we reproduce verbatim). Change to PI/3 only if
+      ! you intentionally want 7 distinct B angles instead of matching the data.
       OpNum=OpNum+1
       OrderParameterType(OpNum)%name='B'; OrderParameterType(OpNum)%iarg(1)=n1; OrderParameterType(OpNum)%iarg(2)=n2
-      OrderParameterType(OpNum)%arg(1)=PI/3._PR
+      OrderParameterType(OpNum)%arg(1)=PI/4._PR
 
       OpNum=OpNum+1
       OrderParameterType(OpNum)%name='B'; OrderParameterType(OpNum)%iarg(1)=n1; OrderParameterType(OpNum)%iarg(2)=n2
@@ -335,3 +340,197 @@ subroutine compute_frame_partial(r_central, r_mol, r_list, mol_list_in, &
   deallocate(conn)
 
 end subroutine compute_frame_partial
+
+!==============================================================================
+! 2D (frame x atom/molecule) MPI decomposition entry points.
+!
+! One trajectory frame is computed cooperatively by P MPI ranks that share a
+! sub-communicator.  Each rank owns a disjoint slice [mol_lo,mol_hi] of the
+! n_cen central molecules.  The work is split into two stages that bracket a
+! single MPI all-reduce in Python:
+!
+!   Stage 1  compute_local_range : build the FULL connection matrix, then
+!            compute the LOCAL order parameters and the per-molecule Steinhardt
+!            q_lm (already normalised) for molecules in the rank's slice only.
+!            Out-of-slice columns are returned as ZERO so that an element-wise
+!            MPI_SUM all-reduce across the sub-communicator reconstructs the
+!            full per-molecule arrays EXACTLY (x + 0 + 0 ... = x in IEEE).
+!
+!   (Python all-reduces local_ops, qlm, qnorm over the sub-communicator.)
+!
+!   Stage 2  compute_avg_range   : inject the full per-molecule local/q_lm/qnorm
+!            arrays back into the module, rebuild the connection matrix, then
+!            compute the AVERAGED (Lechner-Dellago) order parameters for the
+!            rank's slice only.  Each mol1 averages over its own neighbour set
+!            in the same fixed order as the serial code, so the slice result is
+!            bit-identical to the full serial computation.
+!
+! Both OO (n_mol == n_cen, r_mol == r_central) and the hydrate "partial" case
+! (n_mol > n_cen) are handled by the same routines.  init_op_calc(n_cen) must
+! have been called first.  The packed q_lm layout (170 complex rows) is:
+!   l = 2 :  1.. 5    l = 6 : 33.. 45    l =12 : 84..108
+!   l = 3 :  6.. 12   l = 8 : 46.. 62    l =14 :109..137
+!   l = 4 : 13.. 21   l =10 : 63.. 83    l =16 :138..170
+!   l = 5 : 22.. 32
+! qnorm rows 1..10 correspond to l = 2,3,4,5,6,8,10,12,14,16.
+!==============================================================================
+subroutine compute_local_range(mol_lo, mol_hi, r_central, r_mol, r_list, &
+                                mol_list_in, lat_vecs, rlat_vecs, rcutsq, &
+                                n_cen, n_mol, n_list, local_ops, qlm_out, qnorm_out)
+  use consts, only: PR
+  use order_parameters, only: ResetOPAccumulators, ComputeConnectionMatrix, &
+       ComputeOrderParameters, ComputeUnaveragedOrderParameters, OrderParameterValue, &
+       q2m, q3m, q4m, q5m, q6m, q8m, q10m, q12m, q14m, q16m, &
+       q2, q3, q4, q5, q6, q8, q10, q12, q14, q16
+
+  implicit none
+
+  integer,  intent(in)  :: mol_lo, mol_hi, n_cen, n_mol, n_list
+  real(PR), intent(in)  :: r_central(3, n_cen)
+  real(PR), intent(in)  :: r_mol(3, n_mol)
+  real(PR), intent(in)  :: r_list(3, n_list)
+  integer,  intent(in)  :: mol_list_in(n_list)
+  real(PR), intent(in)  :: lat_vecs(3, 3)
+  real(PR), intent(in)  :: rlat_vecs(3, 3)
+  real(PR), intent(in)  :: rcutsq
+  real(PR),    intent(out) :: local_ops(383, n_cen)
+  complex(PR), intent(out) :: qlm_out(170, n_cen)
+  real(PR),    intent(out) :: qnorm_out(10, n_cen)
+
+  !f2py intent(in)   :: mol_lo, mol_hi, r_central, r_mol, r_list, mol_list_in
+  !f2py intent(in)   :: lat_vecs, rlat_vecs, rcutsq
+  !f2py intent(hide) :: n_cen, n_mol, n_list
+  !f2py intent(out)  :: local_ops, qlm_out, qnorm_out
+
+  integer, dimension(10) :: SteinhardtQList
+  logical, allocatable   :: conn(:,:)
+  integer :: i, mol
+
+  SteinhardtQList = (/2, 3, 4, 5, 6, 8, 10, 12, 14, 16/)
+
+  allocate(conn(n_mol, n_mol))
+
+  call ResetOPAccumulators
+  call ComputeConnectionMatrix(r_mol, lat_vecs, rlat_vecs, rcutsq, conn)
+  call ComputeOrderParameters(r_central, r_list, mol_list_in, conn, &
+                              lat_vecs, rlat_vecs, SteinhardtQList, mol_lo, mol_hi)
+  call ComputeUnaveragedOrderParameters(SteinhardtQList, mol_lo, mol_hi)
+
+  local_ops = 0._PR
+  qlm_out   = (0._PR, 0._PR)
+  qnorm_out = 0._PR
+
+  do mol = mol_lo, mol_hi
+    do i = 1, 383
+      local_ops(i, mol) = OrderParameterValue(i, mol)%local
+    end do
+    qlm_out(  1:  5, mol) = q2m(:,  mol)
+    qlm_out(  6: 12, mol) = q3m(:,  mol)
+    qlm_out( 13: 21, mol) = q4m(:,  mol)
+    qlm_out( 22: 32, mol) = q5m(:,  mol)
+    qlm_out( 33: 45, mol) = q6m(:,  mol)
+    qlm_out( 46: 62, mol) = q8m(:,  mol)
+    qlm_out( 63: 83, mol) = q10m(:, mol)
+    qlm_out( 84:108, mol) = q12m(:, mol)
+    qlm_out(109:137, mol) = q14m(:, mol)
+    qlm_out(138:170, mol) = q16m(:, mol)
+    qnorm_out(1, mol)  = q2(mol);  qnorm_out(2, mol)  = q3(mol)
+    qnorm_out(3, mol)  = q4(mol);  qnorm_out(4, mol)  = q5(mol)
+    qnorm_out(5, mol)  = q6(mol);  qnorm_out(6, mol)  = q8(mol)
+    qnorm_out(7, mol)  = q10(mol); qnorm_out(8, mol)  = q12(mol)
+    qnorm_out(9, mol)  = q14(mol); qnorm_out(10, mol) = q16(mol)
+  end do
+
+  deallocate(conn)
+
+end subroutine compute_local_range
+
+!==============================================================================
+subroutine compute_avg_range(mol_lo, mol_hi, r_mol, lat_vecs, rlat_vecs, rcutsq, &
+                              local_in, qlm_in, qnorm_in, n_cen, n_mol, &
+                              local_ops, avg_ops)
+  use consts, only: PR
+  use order_parameters, only: ComputeConnectionMatrix, ComputeAveragedOrderParameters, &
+       OrderParameterValue, &
+       q2m, q3m, q4m, q5m, q6m, q8m, q10m, q12m, q14m, q16m, &
+       q2, q3, q4, q5, q6, q8, q10, q12, q14, q16, &
+       q2m_avg, q3m_avg, q4m_avg, q5m_avg, q6m_avg, q8m_avg, q10m_avg, q12m_avg, q14m_avg, q16m_avg, &
+       lq2m, lq3m, lq4m, lq5m, lq6m, lq8m, lq10m, lq12m, lq14m, lq16m
+
+  implicit none
+
+  integer,  intent(in)  :: mol_lo, mol_hi, n_cen, n_mol
+  real(PR), intent(in)  :: r_mol(3, n_mol)
+  real(PR), intent(in)  :: lat_vecs(3, 3)
+  real(PR), intent(in)  :: rlat_vecs(3, 3)
+  real(PR), intent(in)  :: rcutsq
+  real(PR),    intent(in)  :: local_in(383, n_cen)
+  complex(PR), intent(in)  :: qlm_in(170, n_cen)
+  real(PR),    intent(in)  :: qnorm_in(10, n_cen)
+  real(PR),    intent(out) :: local_ops(383, n_cen)
+  real(PR),    intent(out) :: avg_ops(383, n_cen)
+
+  !f2py intent(in)   :: mol_lo, mol_hi, r_mol, lat_vecs, rlat_vecs, rcutsq
+  !f2py intent(in)   :: local_in, qlm_in, qnorm_in
+  !f2py intent(hide) :: n_cen, n_mol
+  !f2py intent(out)  :: local_ops, avg_ops
+
+  integer, dimension(10) :: SteinhardtQList
+  logical, allocatable   :: conn(:,:)
+  integer :: i, mol
+
+  SteinhardtQList = (/2, 3, 4, 5, 6, 8, 10, 12, 14, 16/)
+
+  allocate(conn(n_mol, n_mol))
+  call ComputeConnectionMatrix(r_mol, lat_vecs, rlat_vecs, rcutsq, conn)
+
+  ! Inject the FULL (already all-reduced) per-molecule state for every central
+  ! molecule, since averaging mol1 reads its neighbours' local/q_lm/qnorm.
+  ! Zero the averaging accumulators (q_lm_avg, lq_lm, %avg) WITHOUT touching the
+  ! injected q_lm (so we must NOT call ResetOPAccumulators here).
+  do mol = 1, n_cen
+    do i = 1, 383
+      OrderParameterValue(i, mol)%local = local_in(i, mol)
+      OrderParameterValue(i, mol)%avg   = 0._PR
+    end do
+    q2m(:,  mol) = qlm_in(  1:  5, mol)
+    q3m(:,  mol) = qlm_in(  6: 12, mol)
+    q4m(:,  mol) = qlm_in( 13: 21, mol)
+    q5m(:,  mol) = qlm_in( 22: 32, mol)
+    q6m(:,  mol) = qlm_in( 33: 45, mol)
+    q8m(:,  mol) = qlm_in( 46: 62, mol)
+    q10m(:, mol) = qlm_in( 63: 83, mol)
+    q12m(:, mol) = qlm_in( 84:108, mol)
+    q14m(:, mol) = qlm_in(109:137, mol)
+    q16m(:, mol) = qlm_in(138:170, mol)
+    q2(mol)  = qnorm_in(1, mol);  q3(mol)  = qnorm_in(2, mol)
+    q4(mol)  = qnorm_in(3, mol);  q5(mol)  = qnorm_in(4, mol)
+    q6(mol)  = qnorm_in(5, mol);  q8(mol)  = qnorm_in(6, mol)
+    q10(mol) = qnorm_in(7, mol);  q12(mol) = qnorm_in(8, mol)
+    q14(mol) = qnorm_in(9, mol);  q16(mol) = qnorm_in(10, mol)
+    q2m_avg(:,  mol) = (0._PR, 0._PR); q3m_avg(:,  mol) = (0._PR, 0._PR)
+    q4m_avg(:,  mol) = (0._PR, 0._PR); q5m_avg(:,  mol) = (0._PR, 0._PR)
+    q6m_avg(:,  mol) = (0._PR, 0._PR); q8m_avg(:,  mol) = (0._PR, 0._PR)
+    q10m_avg(:, mol) = (0._PR, 0._PR); q12m_avg(:, mol) = (0._PR, 0._PR)
+    q14m_avg(:, mol) = (0._PR, 0._PR); q16m_avg(:, mol) = (0._PR, 0._PR)
+    lq2m(:,  mol) = (0._PR, 0._PR); lq3m(:,  mol) = (0._PR, 0._PR)
+    lq4m(:,  mol) = (0._PR, 0._PR); lq5m(:,  mol) = (0._PR, 0._PR)
+    lq6m(:,  mol) = (0._PR, 0._PR); lq8m(:,  mol) = (0._PR, 0._PR)
+    lq10m(:, mol) = (0._PR, 0._PR); lq12m(:, mol) = (0._PR, 0._PR)
+    lq14m(:, mol) = (0._PR, 0._PR); lq16m(:, mol) = (0._PR, 0._PR)
+  end do
+
+  call ComputeAveragedOrderParameters(SteinhardtQList, SteinhardtQList, conn, mol_lo, mol_hi)
+
+  local_ops = 0._PR
+  avg_ops   = 0._PR
+  do mol = mol_lo, mol_hi
+    do i = 1, 383
+      local_ops(i, mol) = OrderParameterValue(i, mol)%local
+      avg_ops(i, mol)   = OrderParameterValue(i, mol)%avg
+    end do
+  end do
+
+  deallocate(conn)
+
+end subroutine compute_avg_range

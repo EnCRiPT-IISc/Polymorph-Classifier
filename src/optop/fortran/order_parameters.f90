@@ -138,21 +138,31 @@ contains
   end subroutine ComputeConnectionMatrix
 
   !=========================================================================================================================
-  subroutine ComputeOrderParameters(r1,r2,mol_list,ConnectionMatrix,LatVecs,RLatVecs,SteinhardtQList)
+  subroutine ComputeOrderParameters(r1,r2,mol_list,ConnectionMatrix,LatVecs,RLatVecs,SteinhardtQList,mol_lo,mol_hi)
     real(PR), dimension(:,:), intent(in) :: r1,r2
     integer, dimension(:), intent(in) :: mol_list
     logical, dimension(:,:), intent(in) :: ConnectionMatrix
     real(PR), dimension(3,3), intent(in) :: LatVecs, RLatVecs
     integer, dimension(:), intent(in) :: SteinhardtQList
-    
+    !** Optional molecule range [mol_lo,mol_hi]; defaults to all central
+    !** molecules.  Restricting the range lets several MPI ranks each compute a
+    !** disjoint slice of the central molecules within one frame (2D decomp).
+    !** Every mol1 is computed independently, so a slice's result is identical
+    !** to the full-range serial computation.
+    integer, intent(in), optional :: mol_lo, mol_hi
+
     integer :: atm2, atm3
     integer :: mol1, mol2, mol3
     real(PR) :: rij(3), rik(3), rjk(3), rij_m, rik_m, rjk_m, theta_kij
     integer :: n_1, n_2, n_alpha, n_beta, n_gamma
     real(PR) :: phi, a
     integer :: OpNum
+    integer :: m_lo, m_hi
 
-    do mol1=1,size(r1,2)
+    m_lo = 1;          if(present(mol_lo)) m_lo = mol_lo
+    m_hi = size(r1,2); if(present(mol_hi)) m_hi = mol_hi
+
+    do mol1=m_lo,m_hi
       atom2:do atm2=1,size(r2,2)
         mol2=mol_list(atm2)
         if(ConnectionMatrix(mol1,mol2))then
@@ -208,12 +218,17 @@ contains
     end do
   end subroutine ComputeOrderParameters
 
-  subroutine ComputeUnaveragedOrderParameters(SteinhardtQList)
+  subroutine ComputeUnaveragedOrderParameters(SteinhardtQList,mol_lo,mol_hi)
     integer, dimension(:), intent(in) :: SteinhardtQList
+    integer, intent(in), optional :: mol_lo, mol_hi   !** optional molecule range (2D decomp)
 
     integer :: mol1, l, OpNum
+    integer :: m_lo, m_hi
 
-    do mol1=1,NumberOfMolecules
+    m_lo = 1;                 if(present(mol_lo)) m_lo = mol_lo
+    m_hi = NumberOfMolecules; if(present(mol_hi)) m_hi = mol_hi
+
+    do mol1=m_lo,m_hi
       call ComputeSteinhardt_q(mol1,N(mol1),SteinhardtQList)
 
       do OpNum=1,NumberOfOrderParameters
@@ -284,14 +299,19 @@ contains
   end subroutine ComputeUnaveragedOrderParameters
 
   !=========================================================================================================================
-  subroutine ComputeAveragedOrderParameters(SteinhardtQavgList, SteinhardtLQList,ConnectionMatrix)
+  subroutine ComputeAveragedOrderParameters(SteinhardtQavgList, SteinhardtLQList,ConnectionMatrix,mol_lo,mol_hi)
     integer, dimension(:), intent(in) :: SteinhardtQavgList, SteinhardtLQList
     logical, dimension(:,:), intent(in) :: ConnectionMatrix
-    
+    integer, intent(in), optional :: mol_lo, mol_hi   !** optional central-molecule range (2D decomp)
+
     integer :: mol1, mol2
     integer :: NumberOfNeighbors, i, l, OpNum
+    integer :: m_lo, m_hi
 
-    do mol1=1,NumberOfMolecules
+    m_lo = 1;                 if(present(mol_lo)) m_lo = mol_lo
+    m_hi = NumberOfMolecules; if(present(mol_hi)) m_hi = mol_hi
+
+    do mol1=m_lo,m_hi
       !******   Sum over local OPs   ****************
       do mol2=1,NumberOfMolecules
         if(ConnectionMatrix(mol1,mol2))then
