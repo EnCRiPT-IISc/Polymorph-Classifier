@@ -285,7 +285,7 @@ end subroutine compute_frame
 !                  mapping each to its molecule index in 1..n_mol.
 !
 ! init_op_calc(n_cen) must be called first, so the module NumberOfMolecules =
-! n_cen.  The (un)averaged loops then run over 1..n_cen only — guest molecules
+! n_cen.  The (un)averaged loops then run over 1..n_cen only - guest molecules
 ! contribute to a water O's LOCAL Steinhardt (as neighbours via the connection
 ! matrix) but are excluded from the averaging set, exactly as in the reference.
 !==============================================================================

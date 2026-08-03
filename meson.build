@@ -35,7 +35,11 @@ op_module = custom_target('_op_fortran_module',
            '_op_fortran-f2pywrappers.f',
            '_op_fortran-f2pywrappers2.f90'],
   command: [py, '-m', 'numpy.f2py', '@INPUT@',
-            '-m', '_op_fortran', '--lower', '--build-dir', '@OUTDIR@'])
+            '-m', '_op_fortran', '--lower', '--build-dir', '@OUTDIR@'],
+  # f2py reads the sources through fileinput, which decodes using the locale
+  # encoding. Under a C/POSIX locale (as in an isolated pip build) any non-ASCII
+  # byte in a comment raises UnicodeDecodeError, so force UTF-8 mode here.
+  env: {'PYTHONUTF8': '1', 'PYTHONIOENCODING': 'utf-8'})
 
 py.extension_module('_op_fortran',
   fortran_sources + [op_module, fortranobject_c],
