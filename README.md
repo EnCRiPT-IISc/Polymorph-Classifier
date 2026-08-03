@@ -6,7 +6,7 @@ Complete pipeline from LAMMPS trajectories to ML phase classification. Computes 
 
 ```bash
 # From GitHub (private repo — requires access)
-pip install git+https://github.com/dikshaiisc/OrderParameter.git
+pip install git+https://github.com/EnCRiPT-IISc/Polymorph-Classifier.git
 
 # For OP computation, build the Fortran extension first:
 cd src/op_ml/fortran && make
