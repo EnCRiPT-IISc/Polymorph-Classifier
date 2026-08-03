@@ -76,8 +76,15 @@ pip install git+https://github.com/EnCRiPT-IISc/Polymorph-Classifier.git
 
 Two subcommands from OP_ML have no OptOP equivalent yet: `validate` (standalone
 NaN checking — OptOP instead fails fast during computation) and the interactive
-phase-merging prompts. `OP_ML_Documentation.pdf` in this repository documents the
-older version and has not yet been rewritten for OptOP.
+phase-merging prompts.
+
+## Documentation
+
+[`OptOP_Documentation.pdf`](OptOP_Documentation.pdf) is the full user guide:
+every flag, the neighbour and centre-of-mass conventions, both MPI decompositions,
+the periodic-boundary modes, every output file, worked examples, and a migration
+section covering what changed from OP_ML. It replaces the previous
+`OP_ML_Documentation.pdf`, which described the superseded package.
 
 ## Command line
 
