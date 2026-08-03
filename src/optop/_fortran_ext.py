@@ -102,7 +102,7 @@ def _load():
     if _ext is not None:
         return _ext
     try:
-        from op_ml import _op_fortran as ext
+        from optop import _op_fortran as ext
         _ext = ext
     except ImportError:
         # Try auto-build
@@ -110,9 +110,9 @@ def _load():
             try:
                 # Reload after build
                 import importlib
-                import op_ml
-                importlib.reload(op_ml)
-                from op_ml import _op_fortran as ext
+                import optop
+                importlib.reload(optop)
+                from optop import _op_fortran as ext
                 _ext = ext
             except ImportError:
                 pass
@@ -152,9 +152,104 @@ def compute_frame(
     return local_f.T.copy(), avg_f.T.copy()
 
 
+def compute_frame_partial(
+    r_central: np.ndarray,   # (n_cen, 3)  central atoms (e.g. water O) — these are r1
+    r_mol: np.ndarray,       # (n_mol, 3)  one centre per molecule (water O + guest M)
+    r_list: np.ndarray,      # (n_list, 3) neighbour atoms
+    mol_list: np.ndarray,    # (n_list,)   molecule index (1..n_mol) of each neighbour atom
+    box: np.ndarray,
+    rcutsq: float,
+) -> tuple:
+    """Hydrate-style OP for the first n_cen molecules.
+
+    The connection matrix is built over all n_mol molecule centres (so a central
+    water O sees a guest molecule as a neighbour), but order parameters are
+    computed and averaged only over the n_cen central molecules — guests
+    contribute to the local Steinhardt as neighbours but not to the averaging
+    set.  Mirrors code/hydrate_OHM.f90.  init(n_cen) must be called first.
+    """
+    ext = _load()
+    lat_vecs, rlat_vecs = build_lat_vecs(box)
+    rc_f = np.asfortranarray(r_central.T)
+    rm_f = np.asfortranarray(r_mol.T)
+    rl_f = np.asfortranarray(r_list.T)
+    ml = np.ascontiguousarray(mol_list, dtype=np.int32)
+    local_f, avg_f = ext.compute_frame_partial(
+        rc_f, rm_f, rl_f, ml, lat_vecs, rlat_vecs, rcutsq)
+    return local_f.T.copy(), avg_f.T.copy()
+
+
+def compute_local_range(
+    mol_lo: int, mol_hi: int,
+    r_central: np.ndarray,   # (n_cen, 3)
+    r_mol: np.ndarray,       # (n_mol, 3)
+    r_list: np.ndarray,      # (n_list, 3)
+    mol_list: np.ndarray,    # (n_list,)
+    lat_vecs: np.ndarray,
+    rlat_vecs: np.ndarray,
+    rcutsq: float,
+) -> tuple:
+    """Stage 1 of the 2D decomposition: local OPs + normalised q_lm + q-norms
+    for central molecules in the 1-based inclusive range [mol_lo, mol_hi].
+
+    Returns (local, qlm, qnorm) shaped (383, n_cen), (170, n_cen), (10, n_cen)
+    with columns OUTSIDE the range set to exactly zero, so an element-wise
+    MPI_SUM all-reduce across a frame-group rebuilds the full arrays exactly.
+    init(n_cen) must have been called first.
+    """
+    ext = _load()
+    rc_f = np.asfortranarray(r_central.T)
+    rm_f = np.asfortranarray(r_mol.T)
+    rl_f = np.asfortranarray(r_list.T)
+    ml = np.ascontiguousarray(mol_list, dtype=np.int32)
+    local, qlm, qnorm = ext.compute_local_range(
+        mol_lo, mol_hi, rc_f, rm_f, rl_f, ml, lat_vecs, rlat_vecs, rcutsq)
+    return local, qlm, qnorm   # kept in (rows, n_cen) Fortran layout for all-reduce
+
+
+def compute_avg_range(
+    mol_lo: int, mol_hi: int,
+    r_mol: np.ndarray,        # (n_mol, 3)
+    lat_vecs: np.ndarray,
+    rlat_vecs: np.ndarray,
+    rcutsq: float,
+    local_full: np.ndarray,   # (383, n_cen)  — all-reduced stage-1 output
+    qlm_full: np.ndarray,     # (170, n_cen)  — all-reduced stage-1 output
+    qnorm_full: np.ndarray,   # (10, n_cen)   — all-reduced stage-1 output
+) -> tuple:
+    """Stage 2 of the 2D decomposition: averaged (Lechner-Dellago) OPs for
+    central molecules in [mol_lo, mol_hi], given the full all-reduced per-molecule
+    state.  Returns (local, avg) shaped (383, n_cen) with out-of-range columns
+    zero (so an MPI_SUM all-reduce rebuilds the full frame)."""
+    ext = _load()
+    rm_f = np.asfortranarray(r_mol.T)
+    lf = np.asfortranarray(local_full)
+    qf = np.asfortranarray(qlm_full)
+    nf = np.asfortranarray(qnorm_full)
+    local, avg = ext.compute_avg_range(
+        mol_lo, mol_hi, rm_f, lat_vecs, rlat_vecs, rcutsq, lf, qf, nf)
+    return local, avg
+
+
 def build_lat_vecs(box: np.ndarray):
-    lx, ly, lz = box
-    lat = np.array([[lx, 0., 0.], [0., ly, 0.], [0., 0., lz]],
+    """Build the lattice matrix (and its inverse) from a box descriptor.
+
+    ``box`` is (lx, ly, lz, xy, xz, yz); the tilt factors are zero for an
+    orthogonal cell, in which case the matrix is diagonal.  The columns are the
+    Cartesian lattice vectors in LAMMPS convention:
+        a = (lx, 0, 0),  b = (xy, ly, 0),  c = (xz, yz, lz)
+    so that ApplyPBC's ``cartesian = LatVecs . fractional`` gives the correct
+    minimum image for triclinic cells (e.g. structure sH).
+    """
+    box = np.asarray(box, dtype=np.float64).ravel()
+    if box.size >= 6:
+        lx, ly, lz, xy, xz, yz = box[:6]
+    else:
+        lx, ly, lz = box[:3]
+        xy = xz = yz = 0.0
+    lat = np.array([[lx, xy, xz],
+                    [0., ly, yz],
+                    [0., 0., lz]],
                    dtype=np.float64, order='F')
     rlat = np.asfortranarray(np.linalg.inv(lat))
     return lat, rlat

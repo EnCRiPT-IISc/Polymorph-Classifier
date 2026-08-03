@@ -1,0 +1,16 @@
+__pycache__/
+*.py[cod]
+*.so
+build/
+builddir/
+dist/
+*.egg-info/
+.eggs/
+*.pkl
+*.png
+results/
+out/
+# anchored to the repo root: this is an output directory, NOT src/optop/ml/
+/ml/
+.ipynb_checkpoints/
+.venv/
