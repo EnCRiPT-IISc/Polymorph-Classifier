@@ -36,14 +36,9 @@ order‑parameter families, and the ML hyper‑parameters.
 
 Requires a Fortran compiler (`gfortran` or Intel `ifx`/`mpiifx`) at build time.
 
-```bash
-pip install git+https://github.com/dikshaiisc/OptOP.git
-```
-
-From a local clone (editable):
+OptOP is not yet published to a Git host, so install it from a local clone:
 
 ```bash
-git clone https://github.com/dikshaiisc/OptOP.git
 cd OptOP
 pip install -e .
 # optional MPI support:
@@ -51,7 +46,14 @@ pip install -e ".[mpi]"
 ```
 
 The Fortran extension is compiled automatically at install time via
-`meson-python` + `f2py`.
+`meson-python` + `f2py` — there is no separate `make` step.
+
+> **Not the same package as OP_ML.** `EnCRiPT-IISc/Polymorph-Classifier`
+> publishes an earlier, separate codebase (distribution `OP_ML`, import
+> `op_ml`, CLI `OP_ML`) that ships its Fortran sources uncompiled and does not
+> include OptOP's 2-D MPI decomposition, `--structure` or `--atom-ranks`.
+> Installing it does **not** give you `optop`, and the two can be installed
+> side by side without conflict.
 
 ## Command line
 

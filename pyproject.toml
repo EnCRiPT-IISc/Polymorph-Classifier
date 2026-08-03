@@ -35,6 +35,6 @@ mpi = ["mpi4py"]
 OptOP = "optop.cli:main"
 optop = "optop.cli:main"
 
-[project.urls]
-Homepage = "https://github.com/dikshaiisc/OptOP"
-Repository = "https://github.com/dikshaiisc/OptOP"
+# [project.urls] intentionally omitted until OptOP has a published home.
+# The previous dikshaiisc/OptOP URLs did not resolve, so shipping them in the
+# package metadata advertised a dead link.

@@ -10,6 +10,7 @@ dist/
 *.png
 results/
 out/
-ml/
+# anchored to the repo root: this is an output directory, NOT src/optop/ml/
+/ml/
 .ipynb_checkpoints/
 .venv/
